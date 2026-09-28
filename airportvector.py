@@ -4,19 +4,19 @@
 # Commercial SaaS hosting or paid API distribution is strictly prohibited.
 # See LICENSE.md in the root directory for full terms.
 """
-AirportVector - reference implementation of the Open Airport Vector Grid (OAVG) v2.0.
+AirportVector - reference implementation of the Open Airport Vector Grid (OAVG) v2.1.
 
-    TRZ-D03320331  =  Trichy airport, North-West sector,
-                      X = 0332 (3,320 m West), Y = 0331 (3,310 m North), 10 m cell
+Every point on Earth is coded from its NEAREST commercial airport:
 
-Pure Python, no dependencies, works offline. See docs/spec-v2.pdf for the full spec.
+    TRZ-D04200355  =  Trichy airport, North-West (near band),
+                      X = 0420 (4,200 m West), Y = 0355 (3,550 m North), 10 m cell
 
-Quick use:
-    >>> import airportvector as av
-    >>> av.encode(10.7950461, 78.6793020)            # nearest airport, 10 m cells
-    'TRZ-D03320331'
-    >>> av.decode("TRZ-D03320331")                   # centre of the cell
-    (10.795068, 78.679296)
+The sector letter shows direction AND distance band:
+    A B C D  = NE SE SW NW, under 100 km          (digits as normal)
+    E F G H  = NE SE SW NW, 100 - 999 km          (+1 digit per axis)
+    I J K L  = NE SE SW NW, 1,000 - 9,999 km      (+2 digits per axis)
+
+Pure Python, no dependencies, works offline. Full spec: docs/spec-v2.1.pdf
 """
 from __future__ import annotations
 
@@ -25,27 +25,31 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from functools import lru_cache
 
-__version__ = "2.0.0"
-SPEC_VERSION = "2.0"
+__version__ = "2.1.0"
+SPEC_VERSION = "2.1"
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
-#: precision name -> digits per axis. Cell size = 10 ** (5 - digits) metres.
+#: precision name -> base digits per axis. Cell size = 10 ** (5 - base) metres.
 PRECISIONS = {"1km": 2, "100m": 3, "10m": 4, "1m": 5}
+_PRECISION_NAME = {v: k for k, v in PRECISIONS.items()}
 DEFAULT_PRECISION = "10m"
 
-#: |E| and |N| must be below this (metres) to be encodable from an anchor.
-MAX_OFFSET_M = 100_000
-#: Nominal zone radius: 50 miles.
-NOMINAL_ZONE_M = 80_467
+SECTORS = "ABCD"                 # NE, SE, SW, NW (clockwise)
+MAX_BAND = 2                     # bands 0..2 -> letters A..L
+LETTERS = "ABCDEFGHIJKL"
+BAND_NAMES = ("near", "regional", "far")
+DIRECTIONS = ("North-East", "South-East", "South-West", "North-West")
+
+#: band b holds points with max(|X|, |Y|) < BAND_LIMIT_M[b]
+BAND_LIMIT_M = tuple(100_000 * 10 ** b for b in range(MAX_BAND + 1))
 
 DEFAULT_REGISTRY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anchors.csv")
 
-_CODE_RE = re.compile(r"^([A-Z]{3,4})-([ABCD])(\d+)(?:\.(\d+))?$")
+_CODE_RE = re.compile(r"^([A-Z]{3})-([A-L])(\d+)(?:\.(\d+))?$")
 
 
 class OAVGError(ValueError):
@@ -59,7 +63,6 @@ class OAVGError(ValueError):
 @dataclass(frozen=True)
 class Anchor:
     code: str
-    type: str       # IATA (3 letters) or ICAO (4 letters)
     name: str
     lat: float
     lon: float
@@ -72,31 +75,32 @@ def load_registry(path: str = DEFAULT_REGISTRY) -> dict[str, Anchor]:
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             code = row["code"].strip().upper()
-            kind = row["type"].strip().upper()
-            if kind not in ("IATA", "ICAO") or len(code) != (3 if kind == "IATA" else 4):
-                raise OAVGError(f"Registry row {code!r}: type/length mismatch")
+            if not re.fullmatch(r"[A-Z]{3}", code):
+                raise OAVGError(f"Registry code {code!r} must be 3 letters")
             if code in anchors:
                 raise OAVGError(f"Registry has duplicate code {code!r}")
-            anchors[code] = Anchor(code, kind, row["name"].strip(), float(row["lat"]),
-                                   float(row["lon"]), row["status"].strip().lower())
+            anchors[code] = Anchor(code, row["name"].strip(), float(row["lat"]), float(row["lon"]),
+                                   row.get("status", "active").strip().lower())
     return anchors
 
 
 _registry: dict[str, Anchor] | None = None
+_active: list[tuple[Anchor, float, float, float]] | None = None
 
 
 def registry() -> dict[str, Anchor]:
     """The loaded default registry (loaded once, on first use)."""
     global _registry
     if _registry is None:
-        _registry = load_registry()
-    return _registry
+        use_registry(load_registry())
+    return _registry  # type: ignore[return-value]
 
 
 def use_registry(anchors: dict[str, Anchor]) -> None:
-    """Swap in a different registry (e.g. for tests or a bigger anchor list)."""
-    global _registry
+    """Swap in a different registry (e.g. for tests)."""
+    global _registry, _active
     _registry = anchors
+    _active = [(a, *_unit(a.lat, a.lon)) for a in anchors.values() if a.status == "active"]
 
 
 def get_anchor(code: str) -> Anchor:
@@ -107,94 +111,110 @@ def get_anchor(code: str) -> Anchor:
 
 
 # --------------------------------------------------------------------------
-# Transverse Mercator on WGS84 (Krueger series, same maths as UTM).
-# Grid centred on the anchor, scale factor 1, no false easting/northing.
+# Geodesy on the WGS84 ellipsoid (Vincenty's formulae, ~0.1 mm accuracy).
+# The grid is an Azimuthal Equidistant projection centred on the anchor:
+#     X = s * sin(azimuth),  Y = s * cos(azimuth)
+# where s = true ground distance from the anchor. So sqrt(X^2 + Y^2) is
+# exactly the distance to the airport, anywhere on the globe.
 # --------------------------------------------------------------------------
 
 _A = 6378137.0
 _F = 1 / 298.257223563
-_E = math.sqrt(_F * (2 - _F))
-_N = _F / (2 - _F)
-_n = [_N ** i for i in range(7)]
-_AR = _A / (1 + _N) * (1 + _n[2] / 4 + _n[4] / 64 + _n[6] / 256)  # rectifying radius
-
-_ALPHA = (
-    _n[1] / 2 - 2 * _n[2] / 3 + 5 * _n[3] / 16 + 41 * _n[4] / 180 - 127 * _n[5] / 288 + 7891 * _n[6] / 37800,
-    13 * _n[2] / 48 - 3 * _n[3] / 5 + 557 * _n[4] / 1440 + 281 * _n[5] / 630 - 1983433 * _n[6] / 1935360,
-    61 * _n[3] / 240 - 103 * _n[4] / 140 + 15061 * _n[5] / 26880 + 167603 * _n[6] / 181440,
-    49561 * _n[4] / 161280 - 179 * _n[5] / 168 + 6601661 * _n[6] / 7257600,
-    34729 * _n[5] / 80640 - 3418889 * _n[6] / 1995840,
-    212378941 * _n[6] / 319334400,
-)
-_BETA = (
-    _n[1] / 2 - 2 * _n[2] / 3 + 37 * _n[3] / 96 - _n[4] / 360 - 81 * _n[5] / 512 + 96199 * _n[6] / 604800,
-    _n[2] / 48 + _n[3] / 15 - 437 * _n[4] / 1440 + 46 * _n[5] / 105 - 1118711 * _n[6] / 3870720,
-    17 * _n[3] / 480 - 37 * _n[4] / 840 - 209 * _n[5] / 4480 + 5569 * _n[6] / 90720,
-    4397 * _n[4] / 161280 - 11 * _n[5] / 504 - 830251 * _n[6] / 7257600,
-    4583 * _n[5] / 161280 - 108847 * _n[6] / 3991680,
-    20648693 * _n[6] / 638668800,
-)
+_B = _A * (1 - _F)
 
 
-def _conformal_lat(phi: float) -> float:
-    s = math.sin(phi)
-    return math.atan(math.sinh(math.atanh(s) - _E * math.atanh(_E * s)))
+def _reduced(lat_rad: float) -> tuple[float, float]:
+    u = math.atan2((1 - _F) * math.sin(lat_rad), math.cos(lat_rad))
+    return math.sin(u), math.cos(u)
 
 
-def _geodetic_lat(chi: float) -> float:
-    phi = chi
-    for _ in range(15):
-        s = math.sin(phi)
-        nxt = 2 * math.atan(math.tan(math.pi / 4 + chi / 2) * ((1 + _E * s) / (1 - _E * s)) ** (_E / 2)) - math.pi / 2
-        if abs(nxt - phi) < 1e-15:
-            return nxt
-        phi = nxt
-    return phi
+def _ab(cos2_alpha: float) -> tuple[float, float]:
+    u2 = cos2_alpha * (_A * _A - _B * _B) / (_B * _B)
+    big_a = 1 + u2 / 16384 * (4096 + u2 * (-768 + u2 * (320 - 175 * u2)))
+    big_b = u2 / 1024 * (256 + u2 * (-128 + u2 * (74 - 47 * u2)))
+    return big_a, big_b
 
 
-def _tm_forward(lat: float, dlon: float) -> tuple[float, float]:
-    """(lat, lon - lon0) in radians -> (x, y) metres; y measured from the equator."""
-    t = math.tan(_conformal_lat(lat))
-    xi = math.atan2(t, math.cos(dlon))
-    eta = math.atanh(math.sin(dlon) / math.sqrt(1 + t * t))
-    x, y = eta, xi
-    for j, a in enumerate(_ALPHA, start=1):
-        x += a * math.cos(2 * j * xi) * math.sinh(2 * j * eta)
-        y += a * math.sin(2 * j * xi) * math.cosh(2 * j * eta)
-    return _AR * x, _AR * y
+def _delta_sigma(big_b: float, sin_s: float, cos_s: float, cos2sm: float) -> float:
+    return big_b * sin_s * (cos2sm + big_b / 4 * (cos_s * (-1 + 2 * cos2sm ** 2)
+                            - big_b / 6 * cos2sm * (-3 + 4 * sin_s ** 2) * (-3 + 4 * cos2sm ** 2)))
 
 
-def _tm_inverse(x: float, y: float) -> tuple[float, float]:
-    """(x, y) metres (y from equator) -> (lat, lon - lon0) in radians."""
-    xi, eta = y / _AR, x / _AR
-    xi_p, eta_p = xi, eta
-    for j, b in enumerate(_BETA, start=1):
-        xi_p -= b * math.sin(2 * j * xi) * math.cosh(2 * j * eta)
-        eta_p -= b * math.cos(2 * j * xi) * math.sinh(2 * j * eta)
-    chi = math.asin(math.sin(xi_p) / math.cosh(eta_p))
-    return _geodetic_lat(chi), math.atan2(math.sinh(eta_p), math.cos(xi_p))
+def geodesic_inverse(lat1: float, lon1: float, lat2: float, lon2: float) -> tuple[float, float]:
+    """Distance (m) and initial azimuth (radians, clockwise from North) from point 1 to point 2."""
+    sin_u1, cos_u1 = _reduced(math.radians(lat1))
+    sin_u2, cos_u2 = _reduced(math.radians(lat2))
+    big_l = math.radians(((lon2 - lon1 + 540.0) % 360.0) - 180.0)
+    lam = big_l
+    for _ in range(200):
+        sin_l, cos_l = math.sin(lam), math.cos(lam)
+        sin_s = math.hypot(cos_u2 * sin_l, cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_l)
+        if sin_s == 0:
+            return 0.0, 0.0
+        cos_s = sin_u1 * sin_u2 + cos_u1 * cos_u2 * cos_l
+        sigma = math.atan2(sin_s, cos_s)
+        sin_alpha = cos_u1 * cos_u2 * sin_l / sin_s
+        cos2_alpha = 1 - sin_alpha ** 2
+        cos2sm = cos_s - 2 * sin_u1 * sin_u2 / cos2_alpha if cos2_alpha != 0 else 0.0
+        c = _F / 16 * cos2_alpha * (4 + _F * (4 - 3 * cos2_alpha))
+        lam_prev = lam
+        lam = big_l + (1 - c) * _F * sin_alpha * (sigma + c * sin_s * (cos2sm + c * cos_s * (-1 + 2 * cos2sm ** 2)))
+        if abs(lam - lam_prev) < 1e-13:
+            break
+    else:
+        raise OAVGError("Points are nearly antipodal; geodesic did not converge")
+    big_a, big_b = _ab(cos2_alpha)
+    s = _B * big_a * (sigma - _delta_sigma(big_b, sin_s, cos_s, cos2sm))
+    az = math.atan2(cos_u2 * math.sin(lam), cos_u1 * sin_u2 - sin_u1 * cos_u2 * math.cos(lam))
+    return s, az
 
 
-@lru_cache(maxsize=4096)
-def _y0(anchor_lat: float) -> float:
-    return _tm_forward(math.radians(anchor_lat), 0.0)[1]
+def geodesic_direct(lat1: float, lon1: float, azimuth: float, s: float) -> tuple[float, float]:
+    """Point reached from (lat1, lon1) travelling s metres at initial azimuth (radians)."""
+    if s == 0:
+        return lat1, lon1
+    sin_u1, cos_u1 = _reduced(math.radians(lat1))
+    sin_a1, cos_a1 = math.sin(azimuth), math.cos(azimuth)
+    sigma1 = math.atan2(sin_u1, cos_u1 * cos_a1)
+    sin_alpha = cos_u1 * sin_a1
+    cos2_alpha = 1 - sin_alpha ** 2
+    big_a, big_b = _ab(cos2_alpha)
+    sigma = s / (_B * big_a)
+    for _ in range(200):
+        cos2sm = math.cos(2 * sigma1 + sigma)
+        sin_s, cos_s = math.sin(sigma), math.cos(sigma)
+        sigma_prev = sigma
+        sigma = s / (_B * big_a) + _delta_sigma(big_b, sin_s, cos_s, cos2sm)
+        if abs(sigma - sigma_prev) < 1e-13:
+            break
+    cos2sm = math.cos(2 * sigma1 + sigma)
+    sin_s, cos_s = math.sin(sigma), math.cos(sigma)
+    tmp = sin_u1 * sin_s - cos_u1 * cos_s * cos_a1
+    lat2 = math.atan2(sin_u1 * cos_s + cos_u1 * sin_s * cos_a1, (1 - _F) * math.hypot(sin_alpha, tmp))
+    lam = math.atan2(sin_s * sin_a1, cos_u1 * cos_s - sin_u1 * sin_s * cos_a1)
+    c = _F / 16 * cos2_alpha * (4 + _F * (4 - 3 * cos2_alpha))
+    big_l = lam - (1 - c) * _F * sin_alpha * (sigma + c * sin_s * (cos2sm + c * cos_s * (-1 + 2 * cos2sm ** 2)))
+    lon2 = ((lon1 + math.degrees(big_l) + 540.0) % 360.0) - 180.0
+    return math.degrees(lat2), lon2
+
+
+def distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """True ground distance in metres between two lat/lon points (WGS84)."""
+    return geodesic_inverse(lat1, lon1, lat2, lon2)[0]
 
 
 def to_grid(anchor: Anchor | str, lat: float, lon: float) -> tuple[float, float]:
-    """lat/lon (degrees) -> (E, N) metres from the anchor. E+ = East, N+ = North."""
+    """lat/lon (degrees) -> (X, Y) metres from the anchor. X+ = East, Y+ = North."""
     a = get_anchor(anchor) if isinstance(anchor, str) else anchor
     _check_latlon(lat, lon)
-    dlon = math.radians(((lon - a.lon + 540.0) % 360.0) - 180.0)
-    x, y = _tm_forward(math.radians(lat), dlon)
-    return x, y - _y0(a.lat)
+    s, az = geodesic_inverse(a.lat, a.lon, lat, lon)
+    return s * math.sin(az), s * math.cos(az)
 
 
-def from_grid(anchor: Anchor | str, e: float, n: float) -> tuple[float, float]:
-    """(E, N) metres from the anchor -> lat/lon degrees."""
+def from_grid(anchor: Anchor | str, x: float, y: float) -> tuple[float, float]:
+    """(X, Y) metres from the anchor -> lat/lon degrees."""
     a = get_anchor(anchor) if isinstance(anchor, str) else anchor
-    lat, dlon = _tm_inverse(e, n + _y0(a.lat))
-    lon = ((a.lon + math.degrees(dlon) + 540.0) % 360.0) - 180.0
-    return math.degrees(lat), lon
+    return geodesic_direct(a.lat, a.lon, math.atan2(x, y), math.hypot(x, y))
 
 
 def _check_latlon(lat: float, lon: float) -> None:
@@ -202,12 +222,9 @@ def _check_latlon(lat: float, lon: float) -> None:
         raise OAVGError(f"Latitude/longitude out of range: {lat}, {lon}")
 
 
-def ground_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in metres (mean Earth radius). Used to pick the nearest anchor."""
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = p2 - p1, math.radians(lon2 - lon1)
-    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * 6371008.8 * math.asin(min(1.0, math.sqrt(h)))
+def _unit(lat: float, lon: float) -> tuple[float, float, float]:
+    p, l = math.radians(lat), math.radians(lon)
+    return math.cos(p) * math.cos(l), math.cos(p) * math.sin(l), math.sin(p)
 
 
 # --------------------------------------------------------------------------
@@ -217,28 +234,39 @@ def ground_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> flo
 @dataclass(frozen=True)
 class OAVGCode:
     anchor: str
-    sector: str     # A=NE, B=SE, C=SW, D=NW
-    x: int          # cells East (A,B) or West (C,D)
-    y: int          # cells North (A,D) or South (B,C)
-    digits: int     # digits per axis (2..5)
+    sector: str     # A=NE, B=SE, C=SW, D=NW  (quadrant, independent of band)
+    band: int       # 0 near (A-D), 1 regional (E-H), 2 far (I-L)
+    x: int          # cells East (NE/SE) or West (SW/NW)
+    y: int          # cells North (NE/NW) or South (SE/SW)
+    base: int       # base digits per axis from precision (2..5)
+
+    @property
+    def digits(self) -> int:
+        return self.base + self.band
 
     @property
     def cell_size_m(self) -> int:
-        return 10 ** (5 - self.digits)
+        return 10 ** (5 - self.base)
 
     @property
     def precision(self) -> str:
-        return {2: "1km", 3: "100m", 4: "10m", 5: "1m"}[self.digits]
+        return _PRECISION_NAME[self.base]
+
+    @property
+    def letter(self) -> str:
+        return LETTERS[SECTORS.index(self.sector) + 4 * self.band]
 
     def __str__(self) -> str:
-        return f"{self.anchor}-{self.sector}{self.x:0{self.digits}d}{self.y:0{self.digits}d}"
+        d = self.digits
+        return f"{self.anchor}-{self.letter}{self.x:0{d}d}{self.y:0{d}d}"
 
     def display(self) -> str:
-        """Human-friendly form with a dot between X and Y, e.g. TRZ-D0332.0331."""
-        return f"{self.anchor}-{self.sector}{self.x:0{self.digits}d}.{self.y:0{self.digits}d}"
+        """Human-friendly form with a dot between X and Y, e.g. TRZ-D0420.0355."""
+        d = self.digits
+        return f"{self.anchor}-{self.letter}{self.x:0{d}d}.{self.y:0{d}d}"
 
 
-def _digits_for(precision: str | int) -> int:
+def _base_for(precision: str | int) -> int:
     if isinstance(precision, int) and precision in PRECISIONS.values():
         return precision
     key = str(precision).lower().replace(" ", "")
@@ -247,48 +275,53 @@ def _digits_for(precision: str | int) -> int:
     return PRECISIONS[key]
 
 
-def _sector(e: float, n: float) -> str:
+def _sector(x: float, y: float) -> str:
     # Tie rule: exactly zero counts as East / North.
-    if e >= 0:
-        return "A" if n >= 0 else "B"
-    return "D" if n >= 0 else "C"
+    if x >= 0:
+        return "A" if y >= 0 else "B"
+    return "D" if y >= 0 else "C"
 
 
-def encode_grid(anchor: str, e: float, n: float, precision: str | int = DEFAULT_PRECISION) -> str:
-    """Encode grid metres (E, N) from an anchor. Truncates (never rounds)."""
+def _band_of(ax: float, ay: float) -> int:
+    m = max(ax, ay)
+    for b, limit in enumerate(BAND_LIMIT_M):
+        if m < limit:
+            return b
+    raise OAVGError(f"Location is {m / 1000:,.0f} km from the anchor on one axis; "
+                    f"the maximum is {BAND_LIMIT_M[-1] / 1000:,.0f} km")
+
+
+def encode_grid(anchor: str, x: float, y: float, precision: str | int = DEFAULT_PRECISION) -> str:
+    """Encode grid metres (X, Y) from an anchor. Truncates (never rounds)."""
     a = get_anchor(anchor)
-    d = _digits_for(precision)
-    if abs(e) >= MAX_OFFSET_M or abs(n) >= MAX_OFFSET_M:
-        raise OAVGError(f"Location is {abs(e):.0f} m / {abs(n):.0f} m from {a.code}; "
-                        f"must be under {MAX_OFFSET_M:,} m on both axes")
-    cell = 10 ** (5 - d)
-    return str(OAVGCode(a.code, _sector(e, n), int(abs(e) // cell), int(abs(n) // cell), d))
+    base = _base_for(precision)
+    band = _band_of(abs(x), abs(y))
+    cell = 10 ** (5 - base)
+    return str(OAVGCode(a.code, _sector(x, y), band, int(abs(x) // cell), int(abs(y) // cell), base))
 
 
 def nearest_anchor(lat: float, lon: float) -> Anchor:
-    """Canonical anchor: nearest ACTIVE anchor whose grid range contains the point.
-    Ties are broken alphabetically."""
+    """Canonical anchor: the nearest ACTIVE airport by true ground distance.
+    Exact ties are broken alphabetically."""
     _check_latlon(lat, lon)
-    candidates = sorted(
-        ((round(ground_distance_m(lat, lon, a.lat, a.lon), 3), a.code, a)
-         for a in registry().values() if a.status == "active"),
-        key=lambda t: (t[0], t[1]),
-    )
-    for dist, _, a in candidates:
-        if dist > 150_000:  # beyond the square's corner (~141 km): nothing further can fit
-            break
-        e, n = to_grid(a, lat, lon)
-        if abs(e) < MAX_OFFSET_M and abs(n) < MAX_OFFSET_M:
-            return a
-    raise OAVGError("No anchor within range. Spec fallback: use an Open Location Code (Plus Code) "
-                    "prefixed 'OLC:' or add a supplementary ICAO anchor to the registry.")
+    registry()
+    if not _active:
+        raise OAVGError("Registry has no active anchors")
+    px, py, pz = _unit(lat, lon)
+    # Fast pre-filter on the sphere, then exact ellipsoidal distance for close candidates.
+    scored = sorted(((-(ux * px + uy * py + uz * pz), a.code, a) for a, ux, uy, uz in _active))
+    best_dot = -scored[0][0]
+    best_ang = math.acos(max(-1.0, min(1.0, best_dot)))
+    margin = best_ang * 1.01 + 2e-4  # ~1% + ~1.3 km: ellipsoid vs sphere difference
+    shortlist = [a for neg, _, a in scored if math.acos(max(-1.0, min(1.0, -neg))) <= margin]
+    return min(shortlist, key=lambda a: (round(distance_m(lat, lon, a.lat, a.lon), 3), a.code))
 
 
 def encode(lat: float, lon: float, precision: str | int = DEFAULT_PRECISION, anchor: str | None = None) -> str:
     """lat/lon (degrees, WGS84) -> OAVG code.
 
     precision: "1km", "100m", "10m" (default) or "1m".
-    anchor:    force a specific airport (an 'alternate' code). Default = nearest (canonical).
+    anchor:    force a specific airport. Default = nearest airport (the canonical code).
     """
     if anchor is None:
         a = nearest_anchor(lat, lon)
@@ -296,8 +329,8 @@ def encode(lat: float, lon: float, precision: str | int = DEFAULT_PRECISION, anc
         a = get_anchor(anchor)
         if a.status != "active":
             raise OAVGError(f"Anchor {a.code} is {a.status}; it can be decoded but not used for new codes")
-    e, n = to_grid(a, lat, lon)
-    return encode_grid(a.code, e, n, precision)
+    x, y = to_grid(a, lat, lon)
+    return encode_grid(a.code, x, y, precision)
 
 
 def parse(code: str) -> OAVGCode:
@@ -306,19 +339,29 @@ def parse(code: str) -> OAVGCode:
         raise OAVGError("Code must be a string")
     m = _CODE_RE.match(code.strip().upper())
     if not m:
-        raise OAVGError(f"Invalid OAVG code {code!r}. Expected e.g. TRZ-D03320331")
-    anchor, sector, first, second = m.groups()
+        raise OAVGError(f"Invalid OAVG code {code!r}. Expected e.g. TRZ-D04200355")
+    anchor, letter, first, second = m.groups()
     if second is not None:
         if len(first) != len(second):
             raise OAVGError(f"Invalid code {code!r}: X and Y must have the same number of digits")
         digits = first + second
     else:
         digits = first
-    if len(digits) not in (4, 6, 8, 10):
-        raise OAVGError(f"Invalid code {code!r}: needs 4, 6, 8 or 10 digits (got {len(digits)})")
-    get_anchor(anchor)  # raises if unknown
+    idx = LETTERS.index(letter)
+    sector, band = SECTORS[idx % 4], idx // 4
+    if len(digits) % 2:
+        raise OAVGError(f"Invalid code {code!r}: odd number of digits")
     d = len(digits) // 2
-    return OAVGCode(anchor, sector, int(digits[:d]), int(digits[d:]), d)
+    base = d - band
+    if base not in _PRECISION_NAME:
+        lo, hi = 2 + band, 5 + band
+        raise OAVGError(f"Invalid code {code!r}: sector {letter} needs {lo}-{hi} digits per axis (got {d})")
+    x, y = int(digits[:d]), int(digits[d:])
+    if band > 0 and max(x, y) < 10 ** (d - 1):
+        raise OAVGError(f"Invalid code {code!r}: this location belongs in a nearer band "
+                        f"(use letter {LETTERS[SECTORS.index(sector) + 4 * (band - 1)]})")
+    get_anchor(anchor)  # raises if unknown
+    return OAVGCode(anchor, sector, band, x, y, base)
 
 
 def _signed_index(c: OAVGCode) -> tuple[int, int]:
@@ -327,17 +370,17 @@ def _signed_index(c: OAVGCode) -> tuple[int, int]:
     return i, j
 
 
-def _from_index(anchor: str, i: int, j: int, d: int) -> OAVGCode:
+def _from_index(anchor: str, i: int, j: int, base: int) -> OAVGCode:
     x = i if i >= 0 else -i - 1
     y = j if j >= 0 else -j - 1
-    if x >= 10 ** d or y >= 10 ** d:
-        raise OAVGError("Result is outside the anchor's range")
+    cell = 10 ** (5 - base)
+    band = _band_of(x * cell, y * cell)   # a cell never straddles a band edge
     sector = ("A" if j >= 0 else "B") if i >= 0 else ("D" if j >= 0 else "C")
-    return OAVGCode(anchor, sector, x, y, d)
+    return OAVGCode(anchor, sector, band, x, y, base)
 
 
 def decode_grid(code: str) -> tuple[str, float, float]:
-    """Code -> (anchor, E, N) of the cell centre, in metres."""
+    """Code -> (anchor, X, Y) of the cell centre, in metres."""
     c = parse(code)
     i, j = _signed_index(c)
     size = c.cell_size_m
@@ -346,8 +389,8 @@ def decode_grid(code: str) -> tuple[str, float, float]:
 
 def decode(code: str, ndigits: int = 6) -> tuple[float, float]:
     """Code -> (lat, lon) of the cell centre, rounded to `ndigits` decimals."""
-    anchor, e, n = decode_grid(code)
-    lat, lon = from_grid(anchor, e, n)
+    anchor, x, y = decode_grid(code)
+    lat, lon = from_grid(anchor, x, y)
     return round(lat, ndigits), round(lon, ndigits)
 
 
@@ -360,20 +403,20 @@ def bounds(code: str) -> dict:
 
 
 def move(code: str, east_cells: int = 0, north_cells: int = 0) -> str:
-    """Shift a code by whole cells (negative = West / South). Handles sector crossings."""
+    """Shift a code by whole cells (negative = West / South). Handles sector and band changes."""
     c = parse(code)
     i, j = _signed_index(c)
-    return str(_from_index(c.anchor, i + east_cells, j + north_cells, c.digits))
+    return str(_from_index(c.anchor, i + east_cells, j + north_cells, c.base))
 
 
 def shorten(code: str, precision: str | int) -> str:
-    """Reduce precision by truncation, e.g. TRZ-D0332403312 -> TRZ-D03320331."""
+    """Reduce precision by truncation, e.g. TRZ-D0420303554 -> TRZ-D04200355."""
     c = parse(code)
-    d = _digits_for(precision)
-    if d > c.digits:
+    base = _base_for(precision)
+    if base > c.base:
         raise OAVGError("Cannot add precision that the code does not have")
-    cut = 10 ** (c.digits - d)
-    return str(OAVGCode(c.anchor, c.sector, c.x // cut, c.y // cut, d))
+    cut = 10 ** (c.base - base)
+    return str(OAVGCode(c.anchor, c.sector, c.band, c.x // cut, c.y // cut, base))
 
 
 def normalize(code: str) -> str:
@@ -381,9 +424,34 @@ def normalize(code: str) -> str:
     return str(parse(code))
 
 
+def distance_from_anchor_m(code: str) -> float:
+    """Exact ground distance (m) from the airport to the cell centre: sqrt(X^2 + Y^2)."""
+    _, x, y = decode_grid(code)
+    return math.hypot(x, y)
+
+
+def distance(code1: str, code2: str) -> float:
+    """Ground distance in metres between two codes (works across different airports)."""
+    return distance_m(*decode(code1, 9), *decode(code2, 9))
+
+
+_COMPASS = ("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW")
+
+
+def describe(code: str) -> str:
+    """Plain-language reading, e.g. '5.5 km NW of TRZ (Tiruchirappalli International Airport)'."""
+    c = parse(code)
+    _, x, y = decode_grid(code)
+    d = math.hypot(x, y)
+    bearing = (math.degrees(math.atan2(x, y)) + 360) % 360
+    point = _COMPASS[int((bearing + 11.25) // 22.5) % 16]
+    dist = f"{d / 1000:.1f} km" if d < 10_000 else f"{d / 1000:,.0f} km"
+    return f"{dist} {point} of {c.anchor} ({get_anchor(c.anchor).name})"
+
+
 # --------------------------------------------------------------------------
 # Command line:  python airportvector.py encode 10.795 78.679 [10m]
-#                python airportvector.py decode TRZ-D03320331
+#                python airportvector.py decode TRZ-D04200355
 # --------------------------------------------------------------------------
 
 def _main(argv: list[str]) -> int:
@@ -394,6 +462,7 @@ def _main(argv: list[str]) -> int:
         elif len(argv) == 2 and argv[0] == "decode":
             lat, lon = decode(argv[1])
             print(f"{lat}, {lon}")
+            print(describe(argv[1]))
         else:
             print(usage)
             return 2

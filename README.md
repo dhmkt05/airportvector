@@ -1,39 +1,52 @@
 # airportvector
 An open, human-readable coordinate-to-grid protocol anchored to global airports.
-Reference implementation of the **Open Airport Vector Grid (OAVG) v2.0** — full spec in [`docs/spec-v2.pdf`](docs/spec-v2.pdf).
+Reference implementation of the **Open Airport Vector Grid (OAVG) v2.1** — full spec in [`docs/spec-v2.1.pdf`](docs/spec-v2.1.pdf).
+
+**Every point on Earth gets a code from its nearest commercial airport.**
 
 ```
-TRZ-D03320331
+TRZ-D04200355
 │   │└──┬┘└──┬┘
-│   │   │    └── Y: 0331 cells North  (3,310 m)
-│   │   └─────── X: 0332 cells West   (3,320 m)
-│   └─────────── Sector D = North-West of the airport
+│   │   │    └── Y: 0355 cells North  (3,550 m)
+│   │   └─────── X: 0420 cells West   (4,200 m)
+│   └─────────── Letter D = North-West, near (under 100 km)
 └─────────────── Anchor: TRZ (Tiruchirappalli airport)
 ```
 
-Read it as: *"about 3.3 km north-west of Trichy airport, 10 m square."*
+Read it as: *"about 5.5 km north-west of Trichy airport, 10 m square."*
 
-## How codes work
+## The letter = direction + distance band
 
-| Sector | Direction | X means | Y means |
-|---|---|---|---|
-| A | North-East | metres East | metres North |
-| B | South-East | metres East | metres South |
-| C | South-West | metres West | metres South |
-| D | North-West | metres West | metres North |
+| | North-East | South-East | South-West | North-West | Digits per axis |
+|---|---|---|---|---|---|
+| **Near** (under 100 km) | A | B | C | D | normal |
+| **Regional** (100–999 km) | E | F | G | H | +1 |
+| **Far** (1,000–9,999 km) | I | J | K | L | +2 |
 
-Precision is set by the number of digits (X and Y always the same length):
+Rule of thumb: **every 4 letters = 10× further**. The farthest any place on Earth gets from its nearest commercial airport is about 5,150 km (inside Antarctica), so A–L covers the whole globe.
 
-| Digits | Cell size | Example |
+Examples (10 m precision):
+
+| Place | Code | Meaning |
 |---|---|---|
-| 2 + 2 | 1 km | `TRZ-D0303` |
-| 3 + 3 | 100 m | `TRZ-D033033` |
-| 4 + 4 | 10 m (default) | `TRZ-D03320331` |
-| 5 + 5 | 1 m | `TRZ-D0332403312` |
+| Near Trichy bus stand | `TRZ-D04200355` | 5.5 km NW of Trichy airport |
+| Central London | `LCY-D12710024` | 13 km W of London City airport |
+| Sahara | `DJG-F2590508465` | 273 km ESE of Djanet airport |
+| Point Nemo (Pacific) | `IPC-K104561248302` | 2,694 km SSW of Easter Island airport |
 
-- Every level reaches up to 99,999 m from the airport (the nominal zone is 50 miles / 80 km).
+## Precision
+
+| Base digits per axis | Cell size | Near example |
+|---|---|---|
+| 2 + 2 | 1 km | `TRZ-D0403` |
+| 3 + 3 | 100 m | `TRZ-D042035` |
+| 4 + 4 | 10 m (default) | `TRZ-D04200355` |
+| 5 + 5 | 1 m | `TRZ-D0420303554` |
+
+- Regional codes add 1 digit per axis, far codes add 2.
 - Digits are **truncated**, so a short code is always the start of a longer one.
-- A dot may be added for reading: `TRZ-D0332.0331`.
+- A dot may be added for reading: `TRZ-D0420.0355`.
+- √(X² + Y²) is the **exact** ground distance to the airport.
 
 ## Install & use
 
@@ -42,29 +55,30 @@ Pure Python 3.9+, **no dependencies**, works offline. Copy `airportvector.py` an
 ```python
 import airportvector as av
 
-av.encode(10.7950461, 78.6793020)              # 'TRZ-D03320331'  (nearest airport, 10 m)
-av.encode(10.7950461, 78.6793020, "1m")        # 'TRZ-D0332403312'
-av.decode("TRZ-D03320331")                     # (10.795068, 78.679296)  centre of the cell
-av.move("TRZ-D03320331", east_cells=50)        # 'TRZ-D02820331'  500 m East
-av.shorten("TRZ-D0332403312", "100m")          # 'TRZ-D033033'
-av.parse("trz-d0332.0331")                     # OAVGCode(anchor='TRZ', sector='D', x=332, y=331, digits=4)
+av.encode(10.7950461, 78.6793020)              # 'TRZ-D04200355'  (nearest airport, 10 m)
+av.encode(10.7950461, 78.6793020, "1m")        # 'TRZ-D0420303554'
+av.decode("TRZ-D04200355")                     # (10.795052, 78.679291)  centre of the cell
+av.describe("TRZ-D04200355")                   # '5.5 km NW of TRZ (Tiruchirappalli International Airport)'
+av.distance("TRZ-D04200355", "TRZ-D04200405")  # 500.0  metres between two codes
+av.move("TRZ-D04200355", east_cells=50)        # 'TRZ-D03700355'  500 m East
+av.shorten("TRZ-D0420303554", "100m")          # 'TRZ-D042035'
 ```
 
 Command line:
 
 ```
 python airportvector.py encode 10.7950461 78.6793020 10m
-python airportvector.py decode TRZ-D03320331
+python airportvector.py decode TRZ-D04200355
 ```
 
 ## Anchor registry
 
-Airports live in [`anchors.csv`](anchors.csv). Rules (spec Section 2):
+[`anchors.csv`](anchors.csv) holds 4,133 commercial airports (IATA code, scheduled service), seeded from [OurAirports](https://github.com/davidmegginson/ourairports-data) open data. Rules (spec Section 2):
 
-- Coordinates are **frozen** once added — never edit a lat/lon, or every existing code for that airport moves.
+- Coordinates are **frozen** once published — never edit a lat/lon, or every existing code for that airport moves.
 - Closed airports stay in the file with `status = retired` (they still decode).
 - A code is never re-pointed to a different airport.
-- `verified = no` means the coordinates have not yet been checked against the official Aerodrome Reference Point.
+- `verified = no` means the coordinates have not yet been checked against the official Aerodrome Reference Point. **Verify before a public launch.**
 
 ## Run the tests
 
@@ -73,11 +87,11 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests include every conformance vector from the spec and cross-check the projection maths against PROJ (`pyproj`).
+Includes every conformance vector from the spec and cross-checks the projection against PROJ (`pyproj`).
 
 ## Version history
 
-See [CHANGELOG.md](CHANGELOG.md). v2 codes are **not** compatible with v1.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Licensing & Commercial Use
 AirportVector is source-available under the **Business Source License 1.1**.
