@@ -1,0 +1,4 @@
+code,type,name,lat,lon,status,registered_on,verified
+TRZ,IATA,Tiruchirappalli International Airport,10.7651000,78.7097000,active,2026-09-28,no
+MAA,IATA,Chennai International Airport,12.9941000,80.1709000,active,2026-09-28,no
+LAX,IATA,Los Angeles International Airport,33.9416000,-118.4085000,active,2026-09-28,no
