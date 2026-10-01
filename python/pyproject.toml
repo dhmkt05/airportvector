@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "airportvector"
-version = "2.1.1"
-description = "Airport-anchored location codes: every place on Earth, named from its nearest airport (e.g. TRZ-D04200355)."
+version = "4.0.0"
+description = "Airport-anchored location codes: every place on Earth, named from its nearest airport (e.g. TRZ 55511 79566)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "BUSL-1.1"
@@ -29,7 +29,7 @@ test = ["pytest>=7", "pyproj>=3.4"]
 [project.urls]
 Homepage = "https://airportvector.org"
 Source = "https://github.com/dhmkt05/airportvector"
-Specification = "https://airportvector.org/spec-v2.1.pdf"
+Specification = "https://github.com/dhmkt05/airportvector/blob/main/docs/SPEC-v4.md"
 "Live map" = "https://airportvector.org"
 
 [project.scripts]

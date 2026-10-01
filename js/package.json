@@ -1,7 +1,7 @@
 {
   "name": "airportvector",
-  "version": "2.1.1",
-  "description": "Airport-anchored location codes: every place on Earth, named from its nearest airport (e.g. TRZ-D04200355).",
+  "version": "4.0.0",
+  "description": "Airport-anchored location codes: every place on Earth, named from its nearest airport (e.g. TRZ 55511 79566).",
   "keywords": ["geocoding", "location", "address", "grid", "airport", "iata", "logistics", "geospatial", "plus-code", "offline"],
   "homepage": "https://airportvector.org",
   "repository": { "type": "git", "url": "git+https://github.com/dhmkt05/airportvector.git", "directory": "js" },

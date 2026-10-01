@@ -3,7 +3,7 @@
 **Every place on Earth, named from its nearest airport.**
 
 ```
-TRZ-D04200355   →   5.5 km north-west of Tiruchirappalli airport (10 m square)
+TRZ 55511 79566   →   5.5 km north-west of Tiruchirappalli airport (4 m square)
 ```
 
 Try it live: **[airportvector.org](https://airportvector.org)** · For couriers: **[airportvector.org/logistics](https://airportvector.org/logistics)**
@@ -19,41 +19,46 @@ Both are dependency-free, work offline, ship the same 4,133-airport registry and
 
 ```python
 import airportvector as av
-av.encode(10.7950461, 78.6793020)      # 'TRZ-D04200355'
-av.describe("TRZ-D04200355")           # '5.5 km NW of TRZ (Tiruchirappalli International Airport)'
+av.encode(10.7950461, 78.6793020)      # 'TRZ-55511-79566'
+av.describe("TRZ 55511 79566")         # '5.5 km NW of TRZ (Tiruchirappalli International Airport)'
 ```
 
 ```js
 import av from "airportvector";
-av.encode(51.5074, -0.1278);           // "LCY-D12710024"
+av.encode(51.5074, -0.1278);           // "LCY-55444-38173"
 ```
 
 ## How a code works
 
+Every square splits 3 × 3, named like a phone keypad. `5` is always the part with the airport.
+
 ```
-TRZ-D04200355
-│   │└──┬┘└──┬┘
-│   │   │    └── Y: 0355 cells North  (3,550 m)
-│   │   └─────── X: 0420 cells West   (4,200 m)
-│   └─────────── Letter D = North-West, near (under 100 km)
-└─────────────── Nearest airport: TRZ (Tiruchirappalli)
+1 2 3      NW  N  NE
+4 5 6  =   W   ●   E
+7 8 9      SW  S  SE
 ```
 
-| Letter | Direction | Distance from airport | Digits per axis |
-|---|---|---|---|
-| A B C D | NE SE SW NW | under 100 km | normal |
-| E F G H | NE SE SW NW | 100 – 999 km | +1 |
-| I J K L | NE SE SW NW | 1,000 – 9,999 km | +2 |
+```
+TRZ 55511 79566
+│   └─┬─┘ └─┬─┘
+│     │     └── Second group: the spot inside that square (333 m → 111 m → 37 m → 12 m → 4 m)
+│     └──────── First group: the 1 km square (81 → 27 → 9 → 3 → 1 km), three 5s = within 4.5 km
+└────────────── Nearest airport: TRZ (Tiruchirappalli)
+```
 
-Precision: 1 km, 100 m, 10 m (default) or 1 m. √(X² + Y²) is the exact ground distance to the airport.
-Full specification: [docs/spec-v2.1.pdf](docs/spec-v2.1.pdf).
+- Count the leading 5s for distance: `5` within 40 km, `55` 13.5 km, `555` 4.5 km, `5555` 1.5 km.
+- Places over 121 km from their airport get a longer first group (leading 5s are implied).
+- Any start of a code is a square, so area search is a prefix search.
+- Written `TRZ 55511 79566` for people and `TRZ-55511-79566` in links.
+
+Full specification: [docs/SPEC-v4.md](docs/SPEC-v4.md).
 
 ## Repository layout
 
 ```
 python/   Python package (source of truth for the airport registry: python/src/airportvector/anchors.csv)
 js/       JavaScript package (js/build.mjs generates the entry points and anchors.json from the CSV)
-docs/     Specification
+docs/     Specification (SPEC-v4.md; spec-v2.1.pdf kept for history)
 ```
 
 Run all tests:
@@ -65,7 +70,7 @@ cd js && node build.mjs && npm test
 
 ## Status & license
 
-Draft specification v2.1 — airport coordinates are being verified against official sources.
+Draft specification v4 — airport coordinates are being verified against official sources.
 Not for navigation, aviation or emergency-services use.
 
 Source-available under the **Business Source License 1.1** — see [LICENSE.md](LICENSE.md):

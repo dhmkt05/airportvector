@@ -4,19 +4,27 @@
 # Commercial SaaS hosting or paid API distribution is strictly prohibited.
 # See LICENSE.md in the root directory for full terms.
 """
-AirportVector - reference implementation of the Open Airport Vector Grid (OAVG) v2.1.
+AirportVector - reference implementation of the Open Airport Vector Grid (OAVG) v4.
 
-Every point on Earth is coded from its NEAREST commercial airport:
+Every point on Earth is coded from its NEAREST commercial airport, on a
+"phone keypad" grid centred on that airport:
 
-    TRZ-D04200355  =  Trichy airport, North-West (near band),
-                      X = 0420 (4,200 m West), Y = 0355 (3,550 m North), 10 m cell
+    TRZ 55511 79566  =  Trichy airport, then 10 keypad digits (about 4 m)
 
-The sector letter shows direction AND distance band:
-    A B C D  = NE SE SW NW, under 100 km          (digits as normal)
-    E F G H  = NE SE SW NW, 100 - 999 km          (+1 digit per axis)
-    I J K L  = NE SE SW NW, 1,000 - 9,999 km      (+2 digits per axis)
+Each square is split 3 x 3 and each part is named like a phone keypad:
 
-Pure Python, no dependencies, works offline. Full spec: https://airportvector.org/spec-v2.1.pdf
+    1 2 3      NW  N  NE
+    4 5 6  =   W   *   E          5 is always the part that holds the airport
+    7 8 9      SW  S  SE
+
+- First group (5 digits): the 1 km square, inside a 243 km zone round the airport.
+  Places farther away get a longer first group (6-9 digits); leading 5s are implied.
+- Second group (0-5 digits): position inside the 1 km square (333 m ... 4 m).
+- Count the leading 5s for distance: 5 = within 40 km, 55 = 13.5 km, 555 = 4.5 km.
+- Any start of a code is a square, so area search is a prefix search.
+
+Written TRZ-55511-79566 in links, TRZ 55511 79566 for people.
+Pure Python, no dependencies, works offline. Full spec: https://github.com/dhmkt05/airportvector/blob/main/docs/SPEC-v4.md
 """
 from __future__ import annotations
 
@@ -26,30 +34,28 @@ import os
 import re
 from dataclasses import dataclass
 
-__version__ = "2.1.1"
-SPEC_VERSION = "2.1"
+__version__ = "4.0.0"
+SPEC_VERSION = "4.0"
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
-#: precision name -> base digits per axis. Cell size = 10 ** (5 - base) metres.
-PRECISIONS = {"1km": 2, "100m": 3, "10m": 4, "1m": 5}
+#: precision name -> number of digits in the second group. Cell = 1000 / 3**n metres.
+PRECISIONS = {"1km": 0, "333m": 1, "111m": 2, "37m": 3, "12m": 4, "4m": 5}
 _PRECISION_NAME = {v: k for k, v in PRECISIONS.items()}
-DEFAULT_PRECISION = "10m"
+DEFAULT_PRECISION = "4m"
 
-SECTORS = "ABCD"                 # NE, SE, SW, NW (clockwise)
-MAX_BAND = 2                     # bands 0..2 -> letters A..L
-LETTERS = "ABCDEFGHIJKL"
-BAND_NAMES = ("near", "regional", "far")
-DIRECTIONS = ("North-East", "South-East", "South-West", "North-West")
-
-#: band b holds points with max(|X|, |Y|) < BAND_LIMIT_M[b]
-BAND_LIMIT_M = tuple(100_000 * 10 ** b for b in range(MAX_BAND + 1))
+BASE_ZONE_M = 243_000            # the 5-digit zone: 243 km square centred on the airport
+COARSE_DIGITS = 5                # first group, inside the base zone (ends at 1 km)
+FINE_DIGITS = 5                  # second group at full precision
+MAX_EXTRA = 4                    # up to 4 implied outer levels: 19,683 km zone (every place is
+                                 # within 3,600 km of its nearest airport on each axis)
+KEYPAD_DIRECTIONS = {1: "NW", 2: "N", 3: "NE", 4: "W", 5: "centre", 6: "E", 7: "SW", 8: "S", 9: "SE"}
 
 DEFAULT_REGISTRY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anchors.csv")
 
-_CODE_RE = re.compile(r"^([A-Z]{3})-([A-L])([0-9]+)(?:\.([0-9]+))?$", re.ASCII)
+_CODE_RE = re.compile(r"^([A-Z]{3})[ -]*([0-9]+)(?:[ .-]+([0-9]+))?$", re.ASCII)
 _STATUSES = ("active", "retired")
 
 
@@ -277,40 +283,49 @@ def _unit(lat: float, lon: float) -> tuple[float, float, float]:
 @dataclass(frozen=True)
 class OAVGCode:
     anchor: str
-    sector: str     # A=NE, B=SE, C=SW, D=NW  (quadrant, independent of band)
-    band: int       # 0 near (A-D), 1 regional (E-H), 2 far (I-L)
-    x: int          # cells East (NE/SE) or West (SW/NW)
-    y: int          # cells North (NE/NW) or South (SE/SW)
-    base: int       # base digits per axis from precision (2..5)
+    coarse: str     # first group: 5-10 keypad digits, ends at the 1 km square
+    fine: str       # second group: 0-5 keypad digits inside the 1 km square
 
     @property
-    def digits(self) -> int:
-        return self.base + self.band
+    def extra(self) -> int:
+        """Implied outer levels (0 for places inside the 243 km zone)."""
+        return len(self.coarse) - COARSE_DIGITS
 
     @property
-    def cell_size_m(self) -> int:
-        return 10 ** (5 - self.base)
+    def levels(self) -> int:
+        return len(self.coarse) + len(self.fine)
+
+    @property
+    def zone_m(self) -> int:
+        return BASE_ZONE_M * 3 ** self.extra
+
+    @property
+    def cell_size_m(self) -> float:
+        return 1000 / 3 ** len(self.fine)
 
     @property
     def precision(self) -> str:
-        return _PRECISION_NAME[self.base]
+        return _PRECISION_NAME[len(self.fine)]
 
     @property
-    def letter(self) -> str:
-        return LETTERS[SECTORS.index(self.sector) + 4 * self.band]
+    def leading_fives(self) -> int:
+        """Number of leading 5s in the first group (0 if the code has implied outer levels)."""
+        n = 0
+        while n < len(self.coarse) and self.coarse[n] == "5":
+            n += 1
+        return n
 
     def __str__(self) -> str:
-        d = self.digits
-        return f"{self.anchor}-{self.letter}{self.x:0{d}d}{self.y:0{d}d}"
+        """Canonical form for links and storage, e.g. TRZ-55511-79566."""
+        return f"{self.anchor}-{self.coarse}" + (f"-{self.fine}" if self.fine else "")
 
     def display(self) -> str:
-        """Human-friendly form with a dot between X and Y, e.g. TRZ-D0420.0355."""
-        d = self.digits
-        return f"{self.anchor}-{self.letter}{self.x:0{d}d}.{self.y:0{d}d}"
+        """Form for people, e.g. TRZ 55511 79566."""
+        return f"{self.anchor} {self.coarse}" + (f" {self.fine}" if self.fine else "")
 
 
-def _base_for(precision: str | int) -> int:
-    if isinstance(precision, int) and precision in PRECISIONS.values():
+def _fine_for(precision: str | int) -> int:
+    if isinstance(precision, int) and not isinstance(precision, bool) and precision in _PRECISION_NAME:
         return precision
     key = str(precision).lower().replace(" ", "")
     if key not in PRECISIONS:
@@ -318,31 +333,49 @@ def _base_for(precision: str | int) -> int:
     return PRECISIONS[key]
 
 
-def _sector(x: float, y: float) -> str:
-    # Tie rule: exactly zero counts as East / North.
-    if x >= 0:
-        return "A" if y >= 0 else "B"
-    return "D" if y >= 0 else "C"
-
-
-def _band_of(ax: float, ay: float) -> int:
-    if not (math.isfinite(ax) and math.isfinite(ay)):
+def _extra_for(x: float, y: float) -> int:
+    """Smallest number of implied outer levels whose zone contains (x, y)."""
+    if not (math.isfinite(x) and math.isfinite(y)):
         raise OAVGError("Grid distances must be finite numbers")
-    m = max(ax, ay)
-    for b, limit in enumerate(BAND_LIMIT_M):
-        if m < limit:
-            return b
-    raise OAVGError(f"Location is {m / 1000:,.3f} km from the anchor on one axis; "
-                    f"it must be under {BAND_LIMIT_M[-1] / 1000:,.0f} km")
+    m = max(abs(x), abs(y))
+    for e in range(MAX_EXTRA + 1):
+        if m < BASE_ZONE_M * 3 ** e / 2:
+            return e
+    raise OAVGError(f"Location is {m / 1000:,.3f} km from the anchor on one axis; out of range")
+
+
+def _digits_from_index(col: int, row: int, levels: int) -> str:
+    """Column (from the west edge) and row (from the north edge) -> keypad digits."""
+    out = []
+    for k in range(levels - 1, -1, -1):
+        p = 3 ** k
+        out.append(str((row // p) % 3 * 3 + (col // p) % 3 + 1))
+    return "".join(out)
+
+
+def _index_from_digits(digits: str) -> tuple[int, int]:
+    col = row = 0
+    for ch in digits:
+        d = int(ch) - 1
+        col = col * 3 + d % 3
+        row = row * 3 + d // 3
+    return col, row
 
 
 def encode_grid(anchor: str, x: float, y: float, precision: str | int = DEFAULT_PRECISION) -> str:
-    """Encode grid metres (X, Y) from an anchor. Truncates (never rounds)."""
+    """Encode grid metres (X east, Y north) from an anchor. Truncates (never rounds)."""
     a = get_anchor(anchor)
-    base = _base_for(precision)
-    band = _band_of(abs(x), abs(y))
-    cell = 10 ** (5 - base)
-    return str(OAVGCode(a.code, _sector(x, y), band, int(abs(x) // cell), int(abs(y) // cell), base))
+    fine = _fine_for(precision)
+    extra = _extra_for(x, y)
+    levels = COARSE_DIGITS + extra + fine
+    n = 3 ** levels
+    zone = BASE_ZONE_M * 3 ** extra
+    half = zone / 2
+    col = min(n - 1, max(0, math.floor((x + half) * n / zone)))
+    row = n - 1 - min(n - 1, max(0, math.floor((y + half) * n / zone)))
+    digits = _digits_from_index(col, row, levels)
+    split = COARSE_DIGITS + extra
+    return str(OAVGCode(a.code, digits[:split], digits[split:]))
 
 
 def nearest_anchor(lat: float, lon: float) -> Anchor:
@@ -363,9 +396,9 @@ def nearest_anchor(lat: float, lon: float) -> Anchor:
 
 
 def encode(lat: float, lon: float, precision: str | int = DEFAULT_PRECISION, anchor: str | None = None) -> str:
-    """lat/lon (degrees, WGS84) -> OAVG code.
+    """lat/lon (degrees, WGS84) -> OAVG code, e.g. 'TRZ-55511-79566'.
 
-    precision: "1km", "100m", "10m" (default) or "1m".
+    precision: "1km", "333m", "111m", "37m", "12m" or "4m" (default).
     anchor:    force a specific airport. Default = nearest airport (the canonical code).
     """
     if anchor is None:
@@ -379,59 +412,51 @@ def encode(lat: float, lon: float, precision: str | int = DEFAULT_PRECISION, anc
 
 
 def parse(code: str) -> OAVGCode:
-    """Validate and split a code. Accepts any letter case and the dotted display form."""
+    """Validate and split a code. Accepts any letter case and spaces, hyphens or dots
+    between the groups: 'TRZ 55511 79566', 'trz-55511-79566', 'TRZ5551179566'.
+
+    One block of digits with no separator is read as a full-precision code when it has
+    10 or more digits (the last 5 are the second group), otherwise as a first group only."""
     if not isinstance(code, str):
         raise OAVGError("Code must be a string")
     if not code.isascii() or len(code) > 40:
-        raise OAVGError(f"Invalid OAVG code {code[:40]!r}: use only A-Z, 0-9, '-' and '.'")
+        raise OAVGError(f"Invalid OAVG code {code[:40]!r}: use only A-Z, 1-9, spaces and '-'")
     m = _CODE_RE.match(code.strip().upper())
     if not m:
-        raise OAVGError(f"Invalid OAVG code {code!r}. Expected e.g. TRZ-D04200355")
-    anchor, letter, first, second = m.groups()
-    if second is not None:
-        if len(first) != len(second):
-            raise OAVGError(f"Invalid code {code!r}: X and Y must have the same number of digits")
-        digits = first + second
-    else:
-        digits = first
-    idx = LETTERS.index(letter)
-    sector, band = SECTORS[idx % 4], idx // 4
-    if len(digits) % 2:
-        raise OAVGError(f"Invalid code {code!r}: odd number of digits")
-    d = len(digits) // 2
-    base = d - band
-    if base not in _PRECISION_NAME:
-        lo, hi = 2 + band, 5 + band
-        raise OAVGError(f"Invalid code {code!r}: sector {letter} needs {lo}-{hi} digits per axis (got {d})")
-    x, y = int(digits[:d]), int(digits[d:])
-    if band > 0 and max(x, y) < 10 ** (d - 1):
-        raise OAVGError(f"Invalid code {code!r}: this location belongs in a nearer band "
-                        f"(use letter {LETTERS[SECTORS.index(sector) + 4 * (band - 1)]})")
+        raise OAVGError(f"Invalid OAVG code {code!r}. Expected e.g. TRZ 55511 79566")
+    anchor, coarse, fine = m.groups()
+    if fine is None:
+        whole = coarse
+        if len(whole) >= COARSE_DIGITS + FINE_DIGITS:
+            coarse, fine = whole[:-FINE_DIGITS], whole[-FINE_DIGITS:]
+        else:
+            coarse, fine = whole, ""
+    if "0" in coarse + fine:
+        raise OAVGError(f"Invalid code {code!r}: OAVG digits are 1-9 (0 is never used)")
+    if not COARSE_DIGITS <= len(coarse) <= COARSE_DIGITS + MAX_EXTRA:
+        raise OAVGError(f"Invalid code {code!r}: the first group needs "
+                        f"{COARSE_DIGITS}-{COARSE_DIGITS + MAX_EXTRA} digits (got {len(coarse)})")
+    if len(fine) > FINE_DIGITS:
+        raise OAVGError(f"Invalid code {code!r}: the second group has at most {FINE_DIGITS} digits (got {len(fine)})")
+    # implied 5s: a longer first group that starts with 5 is the same place written long
+    while len(coarse) > COARSE_DIGITS and coarse[0] == "5":
+        coarse = coarse[1:]
     get_anchor(anchor)  # raises if unknown
-    return OAVGCode(anchor, sector, band, x, y, base)
+    return OAVGCode(anchor, coarse, fine)
 
 
-def _signed_index(c: OAVGCode) -> tuple[int, int]:
-    i = c.x if c.sector in "AB" else -c.x - 1
-    j = c.y if c.sector in "AD" else -c.y - 1
-    return i, j
-
-
-def _from_index(anchor: str, i: int, j: int, base: int) -> OAVGCode:
-    x = i if i >= 0 else -i - 1
-    y = j if j >= 0 else -j - 1
-    cell = 10 ** (5 - base)
-    band = _band_of(x * cell, y * cell)   # a cell never straddles a band edge
-    sector = ("A" if j >= 0 else "B") if i >= 0 else ("D" if j >= 0 else "C")
-    return OAVGCode(anchor, sector, band, x, y, base)
+def _cell_index(c: OAVGCode) -> tuple[int, int, int, float, float]:
+    """(col, row, cells across, cell size m, half zone m) for a parsed code."""
+    col, row = _index_from_digits(c.coarse + c.fine)
+    n = 3 ** c.levels
+    return col, row, n, c.zone_m / n, c.zone_m / 2
 
 
 def decode_grid(code: str) -> tuple[str, float, float]:
     """Code -> (anchor, X, Y) of the cell centre, in metres."""
     c = parse(code)
-    i, j = _signed_index(c)
-    size = c.cell_size_m
-    return c.anchor, (i + 0.5) * size, (j + 0.5) * size
+    col, row, _, size, half = _cell_index(c)
+    return c.anchor, (col + 0.5) * size - half, half - (row + 0.5) * size
 
 
 def decode(code: str, ndigits: int = 6) -> tuple[float, float]:
@@ -445,34 +470,50 @@ def cell_polygon(code: str) -> list[tuple[float, float]]:
     """The cell's 4 corners as (lat, lon), in grid order: (-X,-Y), (+X,-Y), (+X,+Y), (-X,+Y).
     Use this to draw the cell on a map. (Near the dateline, longitudes may jump by 360.)"""
     c = parse(code)
-    i, j = _signed_index(c)
-    s = c.cell_size_m
-    return [from_grid(c.anchor, gx * s, gy * s) for gx, gy in ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))]
+    col, row, _, s, half = _cell_index(c)
+    w, e = col * s - half, (col + 1) * s - half
+    n, so = half - row * s, half - (row + 1) * s
+    return [from_grid(c.anchor, gx, gy) for gx, gy in ((w, so), (e, so), (e, n), (w, n))]
 
 
 def move(code: str, east_cells: int = 0, north_cells: int = 0) -> str:
-    """Shift a code by whole cells (negative = West / South). Handles sector and band changes."""
+    """Shift a code by whole cells of its own size (negative = West / South).
+    The result can have a longer or shorter first group if it crosses a zone edge."""
     for v in (east_cells, north_cells):
         if isinstance(v, bool) or not isinstance(v, int):
             raise OAVGError(f"Cells to move must be whole numbers, got {v!r}")
     c = parse(code)
-    i, j = _signed_index(c)
-    return str(_from_index(c.anchor, i + east_cells, j + north_cells, c.base))
+    col, row, _, s, half = _cell_index(c)
+    x = (col + east_cells + 0.5) * s - half
+    y = half - (row - north_cells + 0.5) * s
+    return encode_grid(c.anchor, x, y, len(c.fine))
+
+
+def neighbors(code: str) -> list[str]:
+    """The 8 cells around a code, same size, clockwise from North.
+    Search a code plus its neighbours so places just across a grid line are not missed."""
+    steps = ((0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1))
+    return [move(code, e, n) for e, n in steps]
 
 
 def shorten(code: str, precision: str | int) -> str:
-    """Reduce precision by truncating each half (X and Y), e.g. TRZ-D0420303554 -> TRZ-D04200355."""
+    """Reduce precision by dropping digits from the second group, e.g.
+    TRZ-55511-79566 -> TRZ-55511 (1 km)."""
     c = parse(code)
-    base = _base_for(precision)
-    if base > c.base:
+    fine = _fine_for(precision)
+    if fine > len(c.fine):
         raise OAVGError("Cannot add precision that the code does not have")
-    cut = 10 ** (c.base - base)
-    return str(OAVGCode(c.anchor, c.sector, c.band, c.x // cut, c.y // cut, base))
+    return str(OAVGCode(c.anchor, c.coarse, c.fine[:fine]))
 
 
 def normalize(code: str) -> str:
-    """Canonical form: upper case, no dot."""
+    """Canonical form for links and storage: upper case, groups joined by '-'."""
     return str(parse(code))
+
+
+def display(code: str) -> str:
+    """Form for people: groups separated by spaces, e.g. 'TRZ 55511 79566'."""
+    return parse(code).display()
 
 
 def distance_from_anchor_m(code: str) -> float:
@@ -490,7 +531,7 @@ _COMPASS = ("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", 
 
 
 def describe(code: str) -> str:
-    """Plain-language reading, e.g. '5.5 km NW of TRZ (Tiruchirappalli International Airport)'."""
+    """Plain-language reading, e.g. '7.2 km NNW of TRZ (Tiruchirappalli International Airport)'."""
     c = parse(code)
     _, x, y = decode_grid(code)
     d = math.hypot(x, y)
@@ -501,15 +542,15 @@ def describe(code: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Command line:  python airportvector.py encode 10.795 78.679 [10m]
-#                python airportvector.py decode TRZ-D04200355
+# Command line:  airportvector encode 10.7950461 78.6793020 [4m]
+#                airportvector decode "TRZ 55511 79566"
 # --------------------------------------------------------------------------
 
 def _main(argv: list[str]) -> int:
-    usage = "usage: airportvector encode LAT LON [1km|100m|10m|1m]  |  decode CODE"
+    usage = "usage: airportvector encode LAT LON [1km|333m|111m|37m|12m|4m]  |  decode CODE"
     try:
         if len(argv) in (3, 4) and argv[0] == "encode":
-            print(encode(float(argv[1]), float(argv[2]), argv[3] if len(argv) > 3 else DEFAULT_PRECISION))
+            print(display(encode(float(argv[1]), float(argv[2]), argv[3] if len(argv) > 3 else DEFAULT_PRECISION)))
         elif len(argv) == 2 and argv[0] == "decode":
             lat, lon = decode(argv[1])
             print(f"{lat}, {lon}")
