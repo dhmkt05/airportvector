@@ -1,0 +1,32 @@
+{
+  "name": "airportvector",
+  "version": "2.1.1",
+  "description": "Airport-anchored location codes: every place on Earth, named from its nearest airport (e.g. TRZ-D04200355).",
+  "keywords": ["geocoding", "location", "address", "grid", "airport", "iata", "logistics", "geospatial", "plus-code", "offline"],
+  "homepage": "https://airportvector.org",
+  "repository": { "type": "git", "url": "git+https://github.com/dhmkt05/airportvector.git", "directory": "js" },
+  "bugs": { "url": "https://github.com/dhmkt05/airportvector/issues" },
+  "license": "BUSL-1.1",
+  "author": "AirportVector Authors",
+  "type": "commonjs",
+  "main": "./index.cjs",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "unpkg": "./oavg.js",
+  "jsdelivr": "./oavg.js",
+  "exports": {
+    ".": { "types": "./index.d.ts", "import": "./index.mjs", "require": "./index.cjs" },
+    "./core": { "types": "./core.d.ts", "import": "./core.mjs", "require": "./core.cjs" },
+    "./anchors.json": "./anchors.json",
+    "./oavg.js": "./oavg.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.cjs", "index.mjs", "index.d.ts", "core.cjs", "core.mjs", "core.d.ts", "anchors.cjs", "anchors.mjs", "anchors.json", "oavg.js", "LICENSE.md", "README.md"],
+  "sideEffects": false,
+  "engines": { "node": ">=16" },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/api.test.cjs test/parity.test.cjs",
+    "prepublishOnly": "node build.mjs && node --test test/api.test.cjs test/parity.test.cjs"
+  }
+}

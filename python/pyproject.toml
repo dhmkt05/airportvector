@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airportvector"
+version = "2.1.1"
+description = "Airport-anchored location codes: every place on Earth, named from its nearest airport (e.g. TRZ-D04200355)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "BUSL-1.1"
+license-files = ["LICENSE.md"]
+authors = [{ name = "AirportVector Authors" }]
+keywords = ["geocoding", "location", "address", "grid", "airport", "iata", "logistics", "geospatial", "plus-code"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: GIS",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pyproj>=3.4"]
+
+[project.urls]
+Homepage = "https://airportvector.org"
+Source = "https://github.com/dhmkt05/airportvector"
+Specification = "https://airportvector.org/spec-v2.1.pdf"
+"Live map" = "https://airportvector.org"
+
+[project.scripts]
+airportvector = "airportvector:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+airportvector = ["anchors.csv", "py.typed"]
